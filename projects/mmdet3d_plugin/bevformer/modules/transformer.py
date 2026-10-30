@@ -67,6 +67,29 @@ class PerceptionTransformer(BaseModule):
         self.init_layers()
         self.rotate_center = rotate_center
 
+        self.register_buffer(
+            "cached_spatial_shapes",
+            torch.tensor(
+                [
+                    [116, 200],
+                    [58, 100],
+                    [29, 50],
+                    [15, 25],
+                ],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+
+        self.register_buffer(
+            "cached_level_start_index",
+            torch.tensor(
+                [0, 23200, 29000, 30450],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+
     def init_layers(self):
         """Initialize layers of the Detr3DTransformer."""
         self.level_embeds = nn.Parameter(torch.Tensor(
@@ -100,6 +123,7 @@ class PerceptionTransformer(BaseModule):
         xavier_init(self.reference_points, distribution='uniform', bias=0.)
         xavier_init(self.can_bus_mlp, distribution='uniform', bias=0.)
 
+    # @torch.compile()
     @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'prev_bev', 'bev_pos'))
     def get_bev_features(
             self,
@@ -138,7 +162,7 @@ class PerceptionTransformer(BaseModule):
         shift_y = shift_y * self.use_shift
         shift_x = shift_x * self.use_shift
         shift = bev_queries.new_tensor(
-            [shift_x, shift_y]).permute(1, 0)  # xy, bs -> bs, xy
+            np.stack([shift_x, shift_y])).permute(1, 0)  # xy, bs -> bs, xy
 
         if prev_bev is not None:
             if prev_bev.shape[1] == bev_h * bev_w:
@@ -156,8 +180,10 @@ class PerceptionTransformer(BaseModule):
                     prev_bev[:, i] = tmp_prev_bev[:, 0]
 
         # add can bus signals
+        # can_bus = bev_queries.new_tensor(
+        #     [each['can_bus'] for each in kwargs['img_metas']])  # [:, :]
         can_bus = bev_queries.new_tensor(
-            [each['can_bus'] for each in kwargs['img_metas']])  # [:, :]
+            np.array([each['can_bus'] for each in kwargs['img_metas']]))
         can_bus = self.can_bus_mlp(can_bus)[None, :, :]
         bev_queries = bev_queries + can_bus * self.use_can_bus
 
@@ -175,10 +201,14 @@ class PerceptionTransformer(BaseModule):
             feat_flatten.append(feat)
 
         feat_flatten = torch.cat(feat_flatten, 2)
-        spatial_shapes = torch.as_tensor(
-            spatial_shapes, dtype=torch.long, device=bev_pos.device)
-        level_start_index = torch.cat((spatial_shapes.new_zeros(
-            (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+        # spatial_shapes = torch.as_tensor(
+        #     spatial_shapes, dtype=torch.long, device=bev_pos.device)
+        # level_start_index = torch.cat((spatial_shapes.new_zeros(
+        #     (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+        spatial_shapes = self.cached_spatial_shapes
+        level_start_index = self.cached_level_start_index
+        # print(spatial_shapes)
+        # print(level_start_index)
 
         feat_flatten = feat_flatten.permute(
             0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)

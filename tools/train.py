@@ -3,8 +3,14 @@
 # ---------------------------------------------
 #  Modified by Zhiqi Li
 # ---------------------------------------------
- 
+
 from __future__ import division
+
+# import cv2
+# cv2.setNumThreads(0)
+import torch
+# torch.set_num_threads(1)
+_ = torch.empty(0).pin_memory("musa")
 
 import argparse
 import copy
@@ -17,6 +23,10 @@ from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist
 from os import path as osp
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from mmdet import __version__ as mmdet_version
 from mmdet3d import __version__ as mmdet3d_version
 #from mmdet3d.apis import train_model
@@ -28,7 +38,14 @@ from mmdet.apis import set_random_seed
 from mmseg import __version__ as mmseg_version
 
 from mmcv.utils import TORCH_VERSION, digit_version
+torch.backends.mudnn.allow_tf32 = True
+# torch.backends.musa.matmul.allow_tf32 = False
 
+# MUSA: SDPA with dropout is only correct under MATH backend.
+# nn.MultiheadAttention also calls scaled_dot_product_attention internally.
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
@@ -99,12 +116,22 @@ def parse_args():
     return args
 
 
+from bev_opt_setup import apply_bev_opt as _apply_bev_opt
+
+
 def main():
     args = parse_args()
 
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+
+    # Apply the config-driven optimization switches (cfg.bev_opt -> env vars) BEFORE
+    # the plugin is imported, so its import-time monkeypatches (conv epilogue / FFN)
+    # and all later env-gated reads (frozen_bn, channels_last, DCN backend) are
+    # driven from one config file.
+    _apply_bev_opt(cfg)
+
     # import modules from string list.
     if cfg.get('custom_imports', None):
         from mmcv.utils import import_modules_from_strings
@@ -221,6 +248,15 @@ def main():
         train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
     model.init_weights()
+
+    # OPT-IN (ENABLE_FROZEN_BN=1, default off): freeze backbone BN to a fused affine.
+    # NOTE: backbone BN actually runs in TRAINING mode here (norm_eval=True is not
+    # applied by this mmdet build), so this CHANGES training semantics -> accuracy-gated.
+    try:
+        from projects.mmdet3d_plugin.models.utils.frozen_bn import maybe_freeze_backbone_bn
+        maybe_freeze_backbone_bn(model, logger=logger)
+    except Exception as e:  # never let an opt break training
+        logger.warning(f'[frozen_bn] skipped: {e}')
 
     logger.info(f'Model:\n{model}')
     datasets = [build_dataset(cfg.data.train)]

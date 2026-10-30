@@ -7,6 +7,7 @@
 
 import numpy as np
 import torch
+import torch_musa
 import copy
 import warnings
 from mmcv.cnn.bricks.registry import (ATTENTION,
@@ -17,6 +18,8 @@ from mmcv.runner import force_fp32, auto_fp16
 from mmcv.utils import TORCH_VERSION, digit_version
 from mmcv.utils import ext_loader
 from .custom_base_transformer_layer import MyCustomBaseTransformerLayer
+from .multi_scale_deformable_attn_function import (
+    _get_sca_mask_metadata)
 ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
@@ -44,7 +47,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
         self.fp16_enabled = False
 
     @staticmethod
-    def get_reference_points(H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='cuda', dtype=torch.float):
+    def get_reference_points(H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='musa', dtype=torch.float):
         """Get the reference points used in SCA and TSA.
         Args:
             H, W: spatial shape of bev.
@@ -88,9 +91,9 @@ class BEVFormerEncoder(TransformerLayerSequence):
     @force_fp32(apply_to=('reference_points', 'img_metas'))
     def point_sampling(self, reference_points, pc_range,  img_metas):
         # NOTE: close tf32 here.
-        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        # allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        # torch.backends.cuda.matmul.allow_tf32 = False
+        # torch.backends.cudnn.allow_tf32 = False
 
         lidar2img = []
         for img_meta in img_metas:
@@ -143,8 +146,8 @@ class BEVFormerEncoder(TransformerLayerSequence):
         reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
         bev_mask = bev_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
 
-        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-        torch.backends.cudnn.allow_tf32 = allow_tf32
+        # torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        # torch.backends.cudnn.allow_tf32 = allow_tf32
 
         return reference_points_cam, bev_mask
 
@@ -192,6 +195,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
 
         reference_points_cam, bev_mask = self.point_sampling(
             ref_3d, self.pc_range, kwargs['img_metas'])
+        sca_mask_metadata = _get_sca_mask_metadata(bev_mask)
 
         # bug: this code should be 'shift_ref_2d = ref_2d.clone()', we keep this bug for reproducing our results in paper.
         shift_ref_2d = ref_2d.clone()
@@ -211,6 +215,9 @@ class BEVFormerEncoder(TransformerLayerSequence):
             hybird_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(
                 bs*2, len_bev, num_bev_level, 2)
 
+        bev_shape=torch.tensor(
+            [[bev_h, bev_w]], device=bev_query.device)
+        level_start_index0=torch.tensor([0], device=bev_query.device)
         for lid, layer in enumerate(self.layers):
             output = layer(
                 bev_query,
@@ -224,9 +231,12 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 bev_w=bev_w,
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
+                level_start_index0=level_start_index0,
                 reference_points_cam=reference_points_cam,
                 bev_mask=bev_mask,
+                sca_mask_metadata=sca_mask_metadata,
                 prev_bev=prev_bev,
+                bev_shape=bev_shape,
                 **kwargs)
 
             bev_query = output
@@ -284,6 +294,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
         assert set(operation_order) == set(
             ['self_attn', 'norm', 'cross_attn', 'ffn'])
 
+    @torch.compile()
     def forward(self,
                 query,
                 key=None,
@@ -302,7 +313,9 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                 mask=None,
                 spatial_shapes=None,
                 level_start_index=None,
+                level_start_index0=None,
                 prev_bev=None,
+                bev_shape=None,
                 **kwargs):
         """Forward function for `TransformerDecoderLayer`.
 
@@ -352,7 +365,6 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                                                      f'attn_masks {len(attn_masks)} must be equal ' \
                                                      f'to the number of attention in ' \
                 f'operation_order {self.num_attn}'
-
         for layer in self.operation_order:
             # temporal self attention
             if layer == 'self_attn':
@@ -367,9 +379,11 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                     attn_mask=attn_masks[attn_index],
                     key_padding_mask=query_key_padding_mask,
                     reference_points=ref_2d,
-                    spatial_shapes=torch.tensor(
-                        [[bev_h, bev_w]], device=query.device),
-                    level_start_index=torch.tensor([0], device=query.device),
+                    spatial_shapes=bev_shape,
+                    level_start_index=level_start_index0,
+                    # spatial_shapes=torch.tensor(
+                        # [[bev_h, bev_w]], device=query.device),
+                    # level_start_index=torch.tensor([0], device=query.device),
                     **kwargs)
                 attn_index += 1
                 identity = query
@@ -439,7 +453,7 @@ class MM_BEVFormerLayer(MyCustomBaseTransformerLayer):
         assert len(operation_order) == 6
         assert set(operation_order) == set(
             ['self_attn', 'norm', 'cross_attn', 'ffn'])
-        self.cross_model_weights = torch.nn.Parameter(torch.tensor(0.5), requires_grad=True) 
+        self.cross_model_weights = torch.nn.Parameter(torch.tensor(0.5), requires_grad=True)
         if lidar_cross_attn_layer:
             self.lidar_cross_attn_layer = build_attention(lidar_cross_attn_layer)
             # self.cross_model_weights+=1

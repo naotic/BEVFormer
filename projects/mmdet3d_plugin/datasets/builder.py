@@ -6,7 +6,8 @@ import random
 from functools import partial
 
 import numpy as np
-from mmcv.parallel import collate
+import torch
+from mmcv.parallel import DataContainer, collate
 from mmcv.runner import get_dist_info
 from mmcv.utils import Registry, build_from_cfg
 from torch.utils.data import DataLoader
@@ -15,6 +16,61 @@ from mmdet.datasets.samplers import GroupSampler
 from projects.mmdet3d_plugin.datasets.samplers.group_sampler import DistributedGroupSampler
 from projects.mmdet3d_plugin.datasets.samplers.distributed_sampler import DistributedSampler
 from projects.mmdet3d_plugin.datasets.samplers.sampler import build_sampler
+
+def pin_memory_recursive(obj, device=None):
+    """Pin CPU tensors in nested mmcv batch structures.
+
+    PyTorch's default DataLoader pin_memory does not recurse into
+    DataContainer; BEVFormer batches use DataContainer(list[Tensor]).
+    """
+    if torch.is_tensor(obj):
+        if obj.device.type == 'cpu':
+            # Avoid re-pinning already pinned tensors (can be expensive).
+            if hasattr(obj, "is_pinned") and obj.is_pinned():
+                return obj
+            if device:
+                return obj.pin_memory(device)
+            return obj.pin_memory()
+        return obj
+
+    if isinstance(obj, DataContainer):
+        if obj.cpu_only:
+            return obj
+        return DataContainer(
+            pin_memory_recursive(obj.data, device=device),
+            stack=obj.stack,
+            padding_value=obj.padding_value,
+            cpu_only=obj.cpu_only,
+            pad_dims=obj.pad_dims,
+        )
+
+    if isinstance(obj, dict):
+        return {k: pin_memory_recursive(v, device=device) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        pinned = [pin_memory_recursive(v, device=device) for v in obj]
+        return type(obj)(pinned)
+
+    return obj
+
+
+def _ensure_dataloader_pin_memory_patch():
+    """Patch PyTorch pin thread to handle mmcv DataContainer batches."""
+    import torch.utils.data._utils.pin_memory as pm
+
+    if getattr(pm, '_bevformer_dc_patched', False):
+        return
+
+    _orig_pin_memory = pm.pin_memory
+
+    def _pin_memory_with_datacontainer(data, device=None):
+        if isinstance(data, DataContainer):
+            return pin_memory_recursive(data, device=device)
+        return _orig_pin_memory(data, device)
+
+    pm.pin_memory = _pin_memory_with_datacontainer
+    pm._bevformer_dc_patched = True
+
 
 def build_dataloader(dataset,
                      samples_per_gpu,
@@ -80,16 +136,34 @@ def build_dataloader(dataset,
         worker_init_fn, num_workers=num_workers, rank=rank,
         seed=seed) if seed is not None else None
 
-    data_loader = DataLoader(
-        dataset,
+    # DataLoader kwargs sanity:
+    # - prefetch_factor is only valid when num_workers > 0
+    # - persistent_workers requires num_workers > 0
+    if num_workers == 0:
+        kwargs.pop('prefetch_factor', None)
+        kwargs.pop('persistent_workers', None)
+
+    pin_memory = kwargs.pop('pin_memory', False)
+    persistent_workers = kwargs.pop('persistent_workers', (num_workers > 0))
+
+    if pin_memory:
+        _ensure_dataloader_pin_memory_patch()
+
+    collate_fn = partial(collate, samples_per_gpu=samples_per_gpu)
+
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         sampler=sampler,
         num_workers=num_workers,
-        collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
-        pin_memory=False,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
         worker_init_fn=init_fn,
-        persistent_workers=(num_workers > 0),
-        **kwargs)
+        persistent_workers=persistent_workers,
+        **kwargs,
+    )
+
+    data_loader = DataLoader(**loader_kwargs)
 
     return data_loader
 

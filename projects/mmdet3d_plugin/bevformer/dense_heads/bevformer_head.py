@@ -36,6 +36,7 @@ class BEVFormerHead(DETRHead):
                  code_weights=None,
                  bev_h=30,
                  bev_w=30,
+                 compile_loss_cost=False,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -63,8 +64,40 @@ class BEVFormerHead(DETRHead):
         self.num_cls_fcs = num_cls_fcs - 1
         super(BEVFormerHead, self).__init__(
             *args, transformer=transformer, **kwargs)
+        self.register_buffer(
+            "pc_range_tensor",
+            torch.tensor(self.pc_range, dtype=torch.float32),
+            persistent=False,
+        )
         self.code_weights = nn.Parameter(torch.tensor(
             self.code_weights, requires_grad=False), requires_grad=False)
+        self.compile_loss_cost = compile_loss_cost
+        # FocalLossCost + Hungarian break the graph; compile only helps after
+        # those are isolated.  Keep off by default (see L2 A/B in plan).
+        if compile_loss_cost and hasattr(self, 'assigner'):
+            self.assigner.compute_match_cost = torch.compile(
+                self.assigner.compute_match_cost)
+
+    @staticmethod
+    def _preprocess_gt_batch(gt_bboxes_list, gt_labels_list, device):
+        """Pack GT tensors on device once; reuse across decoder layers."""
+        packed_bboxes = []
+        packed_labels = []
+        for gt_bboxes, gt_labels in zip(gt_bboxes_list, gt_labels_list):
+            gt = torch.cat(
+                (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1)
+            if gt.device != device:
+                gt = gt.to(
+                    device,
+                    non_blocking=gt.is_pinned() if gt.device.type == 'cpu' else False)
+            packed_bboxes.append(gt)
+            if gt_labels.device != device:
+                gt_labels = gt_labels.to(
+                    device,
+                    non_blocking=gt_labels.is_pinned()
+                    if gt_labels.device.type == 'cpu' else False)
+            packed_labels.append(gt_labels)
+        return packed_bboxes, packed_labels
 
     def _init_layers(self):
         """Initialize classification branch and regression branch of head."""
@@ -114,15 +147,79 @@ class BEVFormerHead(DETRHead):
             for m in self.cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
 
+    def _ensure_bev_query_cache(self, bs, dtype, device, prefix=''):
+        """Cache static BEV queries/pos (avoid per-iter .to / rebuild)."""
+        key_attr = f'_{prefix}bev_cache_key'
+        if getattr(self, key_attr, None) == (bs, dtype, device):
+            return
+        bev_queries = self.bev_embedding.weight
+        if bev_queries.dtype != dtype:
+            bev_queries = bev_queries.to(dtype=dtype)
+        bev_mask = torch.zeros(
+            (bs, self.bev_h, self.bev_w), device=device, dtype=dtype)
+        bev_pos = self.positional_encoding(bev_mask)
+        if bev_pos.dtype != dtype:
+            bev_pos = bev_pos.to(dtype=dtype)
+        setattr(
+            self, f'_{prefix}bev_queries',
+            bev_queries.unsqueeze(1).expand(-1, bs, -1))
+        setattr(
+            self, f'_{prefix}bev_pos',
+            bev_pos.flatten(2).permute(2, 0, 1))
+        setattr(self, key_attr, (bs, dtype, device))
+
+    def _ensure_history_bev_cache(self, bs, dtype, device):
+        self._ensure_bev_query_cache(bs, dtype, device, prefix='history_')
+
+    def forward_history_bev_chain(self, img_feats_per_frame, feat_flatten_frames,
+                                  l2i_per_frame, cb_per_frame, prev_exists):
+        """Sequential prev_bev encoder chain for obtain_history (P0 compile target)."""
+        prev_bev = None
+        for i, exists in enumerate(prev_exists):
+            if not exists:
+                prev_bev = None
+            prev_bev = self.forward_only_bev_fast(
+                img_feats_per_frame[i],
+                None,
+                prev_bev,
+                prefetched_lidar2img=l2i_per_frame[i],
+                prefetched_can_bus=cb_per_frame[i],
+                prefetched_feat_flatten=feat_flatten_frames[i],
+            )
+        return prev_bev
+
     @auto_fp16(apply_to=('mlvl_feats'))
-    def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False):
+    def forward_only_bev_fast(self, mlvl_feats, img_metas, prev_bev=None, **kwargs):
+        """Lightweight only_bev path for obtain_history_bev loop."""
+        if kwargs.get('prefetched_feat_flatten') is not None:
+            bs = kwargs['prefetched_feat_flatten'].size(2)
+            dtype = kwargs['prefetched_feat_flatten'].dtype
+            device = kwargs['prefetched_feat_flatten'].device
+        else:
+            bs, _, _, _, _ = mlvl_feats[0].shape
+            dtype = mlvl_feats[0].dtype
+            device = mlvl_feats[0].device
+        self._ensure_history_bev_cache(bs, dtype, device)
+        return self.transformer.get_bev_features(
+            mlvl_feats,
+            self._history_bev_queries,
+            self.bev_h,
+            self.bev_w,
+            grid_length=(self.real_h / self.bev_h, self.real_w / self.bev_w),
+            bev_pos=self._history_bev_pos,
+            img_metas=img_metas,
+            prev_bev=prev_bev,
+            **kwargs)
+
+    @auto_fp16(apply_to=('mlvl_feats'))
+    def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False, **kwargs):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
                 network, each is a 5D-tensor with shape
                 (B, N, C, H, W).
             prev_bev: previous bev featues
-            only_bev: only compute BEV features with encoder. 
+            only_bev: only compute BEV features with encoder.
         Returns:
             all_cls_scores (Tensor): Outputs from the classification head, \
                 shape [nb_dec, bs, num_query, cls_out_channels]. Note \
@@ -151,6 +248,7 @@ class BEVFormerHead(DETRHead):
                 bev_pos=bev_pos,
                 img_metas=img_metas,
                 prev_bev=prev_bev,
+                **kwargs
             )
         else:
             outputs = self.transformer(
@@ -169,38 +267,40 @@ class BEVFormerHead(DETRHead):
         )
 
         bev_embed, hs, init_reference, inter_references = outputs
-        hs = hs.permute(0, 2, 1, 3)
-        outputs_classes = []
-        outputs_coords = []
-        for lvl in range(hs.shape[0]):
-            if lvl == 0:
-                reference = init_reference
-            else:
-                reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
-            outputs_class = self.cls_branches[lvl](hs[lvl])
-            tmp = self.reg_branches[lvl](hs[lvl])
+        # hs = hs.permute(0, 2, 1, 3)
+        # outputs_classes = []
+        # outputs_coords = []
+        # for lvl in range(hs.shape[0]):
+        #     if lvl == 0:
+        #         reference = init_reference
+        #     else:
+        #         reference = inter_references[lvl - 1]
+        #     reference = inverse_sigmoid(reference)
+        #     outputs_class = self.cls_branches[lvl](hs[lvl])
+        #     tmp = self.reg_branches[lvl](hs[lvl])
 
-            # TODO: check the shape of reference
-            assert reference.shape[-1] == 3
-            tmp[..., 0:2] += reference[..., 0:2]
-            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
-            tmp[..., 4:5] += reference[..., 2:3]
-            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
-            tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
-                             self.pc_range[0]) + self.pc_range[0])
-            tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
-                             self.pc_range[1]) + self.pc_range[1])
-            tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
-                             self.pc_range[2]) + self.pc_range[2])
+        #     # TODO: check the shape of reference
+        #     assert reference.shape[-1] == 3
+        #     tmp[..., 0:2] += reference[..., 0:2]
+        #     tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
+        #     tmp[..., 4:5] += reference[..., 2:3]
+        #     tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+        #     tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
+        #                      self.pc_range[0]) + self.pc_range[0])
+        #     tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
+        #                      self.pc_range[1]) + self.pc_range[1])
+        #     tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
+        #                      self.pc_range[2]) + self.pc_range[2])
 
-            # TODO: check if using sigmoid
-            outputs_coord = tmp
-            outputs_classes.append(outputs_class)
-            outputs_coords.append(outputs_coord)
+        #     # TODO: check if using sigmoid
+        #     outputs_coord = tmp
+        #     outputs_classes.append(outputs_class)
+        #     outputs_coords.append(outputs_coord)
 
-        outputs_classes = torch.stack(outputs_classes)
-        outputs_coords = torch.stack(outputs_coords)
+        # outputs_classes = torch.stack(outputs_classes)
+        # outputs_coords = torch.stack(outputs_coords)
+
+        outputs_classes, outputs_coords = self.post_precess(hs, init_reference, inter_references)
 
         outs = {
             'bev_embed': bev_embed,
@@ -211,6 +311,58 @@ class BEVFormerHead(DETRHead):
         }
 
         return outs
+
+    @torch.compile()
+    def post_precess(self, hs, init_reference, inter_references):
+        # hs: [num_layers, num_query, bs, C]
+        hs = hs.permute(0, 2, 1, 3)  # [num_layers, bs, num_query, C]
+
+        outputs_classes = []
+        outputs_coords = []
+
+        pc_range = self.pc_range_tensor.to(dtype=hs.dtype, device=hs.device)
+
+        for lvl in range(len(self.cls_branches)):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+
+            reference = inverse_sigmoid(reference)
+
+            hs_lvl = hs[lvl]
+
+            outputs_class = self.cls_branches[lvl](hs_lvl)
+            tmp = self.reg_branches[lvl](hs_lvl)
+
+            # tmp: [..., 9]，reference: [..., 3]
+            xy = torch.sigmoid(tmp[..., 0:2] + reference[..., 0:2])
+            z = torch.sigmoid(tmp[..., 4:5] + reference[..., 2:3])
+
+            x = xy[..., 0:1] * (pc_range[3] - pc_range[0]) + pc_range[0]
+            y = xy[..., 1:2] * (pc_range[4] - pc_range[1]) + pc_range[1]
+            z = z * (pc_range[5] - pc_range[2]) + pc_range[2]
+
+            # 拼回原 bbox 结构:
+            # [x, y, w, l, z, h, theta, vx, vy]
+            outputs_coord = torch.cat(
+                [
+                    x,
+                    y,
+                    tmp[..., 2:4],
+                    z,
+                    tmp[..., 5:],
+                ],
+                dim=-1,
+            )
+
+            outputs_classes.append(outputs_class)
+            outputs_coords.append(outputs_coord)
+
+        outputs_classes = torch.stack(outputs_classes)
+        outputs_coords = torch.stack(outputs_coords)
+
+        return outputs_classes, outputs_coords
 
     def _get_target_single(self,
                            cls_score,
@@ -270,6 +422,153 @@ class BEVFormerHead(DETRHead):
         bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
         return (labels, label_weights, bbox_targets, bbox_weights,
                 pos_inds, neg_inds)
+
+    def _targets_from_assign(self, assign_result, bbox_pred, gt_bboxes,
+                             gt_labels, gt_bboxes_ignore=None):
+        num_bboxes = bbox_pred.size(0)
+        gt_c = gt_bboxes.shape[-1]
+        sampling_result = self.sampler.sample(assign_result, bbox_pred,
+                                              gt_bboxes)
+        pos_inds = sampling_result.pos_inds
+        neg_inds = sampling_result.neg_inds
+
+        labels = gt_bboxes.new_full((num_bboxes,),
+                                    self.num_classes,
+                                    dtype=torch.long)
+        labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
+        label_weights = gt_bboxes.new_ones(num_bboxes)
+
+        bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c]
+        bbox_weights = torch.zeros_like(bbox_pred)
+        bbox_weights[pos_inds] = 1.0
+        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        return (labels, label_weights, bbox_targets, bbox_weights,
+                pos_inds, neg_inds)
+
+    def _build_assign_result(self, bbox_pred, gt_bboxes, gt_labels,
+                             matched_row_inds, matched_col_inds):
+        from mmdet.core.bbox.assigners import AssignResult
+        num_gts, num_bboxes = gt_bboxes.size(0), bbox_pred.size(0)
+        assigned_gt_inds = bbox_pred.new_full((num_bboxes, ), -1,
+                                              dtype=torch.long)
+        assigned_labels = bbox_pred.new_full((num_bboxes, ), -1,
+                                             dtype=torch.long)
+        if num_gts == 0:
+            assigned_gt_inds[:] = 0
+            return AssignResult(num_gts, assigned_gt_inds, None,
+                                labels=assigned_labels)
+        assigned_gt_inds[:] = 0
+        assigned_gt_inds[matched_row_inds] = matched_col_inds + 1
+        assigned_labels[matched_row_inds] = gt_labels[matched_col_inds]
+        return AssignResult(num_gts, assigned_gt_inds, None,
+                            labels=assigned_labels)
+
+    def _loss_single_with_assigns(self,
+                                  cls_scores,
+                                  bbox_preds,
+                                  assign_results,
+                                  gt_bboxes_list,
+                                  gt_labels_list):
+        num_imgs = cls_scores.size(0)
+        cls_scores_list = [cls_scores[i].detach() for i in range(num_imgs)]
+        bbox_preds_list = [bbox_preds[i].detach() for i in range(num_imgs)]
+        with torch.no_grad():
+            (labels_list, label_weights_list, bbox_targets_list,
+             bbox_weights_list, pos_inds_list, neg_inds_list) = multi_apply(
+                self._targets_from_assign, assign_results, bbox_preds_list,
+                gt_bboxes_list, gt_labels_list,
+                [None for _ in range(num_imgs)])
+        num_total_pos = sum((inds.numel() for inds in pos_inds_list))
+        num_total_neg = sum((inds.numel() for inds in neg_inds_list))
+        labels = torch.cat(labels_list, 0)
+        label_weights = torch.cat(label_weights_list, 0)
+        bbox_targets = torch.cat(bbox_targets_list, 0)
+        bbox_weights = torch.cat(bbox_weights_list, 0)
+
+        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
+        cls_avg_factor = num_total_pos * 1.0 + num_total_neg * self.bg_cls_weight
+        if self.sync_cls_avg_factor:
+            cls_avg_factor = reduce_mean(
+                cls_scores.new_tensor([cls_avg_factor]))
+        if torch.is_tensor(cls_avg_factor):
+            cls_avg_factor = torch.clamp(cls_avg_factor, min=1.0)
+        else:
+            cls_avg_factor = max(cls_avg_factor, 1)
+        loss_cls = self.loss_cls(
+            cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+        bbox_avg_factor = torch.clamp(
+            reduce_mean(loss_cls.new_tensor([float(num_total_pos)])), min=1.0)
+        bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
+        normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
+        isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
+        bbox_weights = bbox_weights * self.code_weights
+        loss_bbox = self.loss_bbox(
+            bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10],
+            bbox_weights[isnotnan, :10], avg_factor=bbox_avg_factor)
+        if digit_version(TORCH_VERSION) >= digit_version('1.8'):
+            loss_cls = torch.nan_to_num(loss_cls)
+            loss_bbox = torch.nan_to_num(loss_bbox)
+        return loss_cls, loss_bbox
+
+    def _loss_all_layers_merged(self,
+                                all_cls_scores,
+                                all_bbox_preds,
+                                gt_bboxes_list,
+                                gt_labels_list):
+        from projects.mmdet3d_plugin.core.bbox.assigners.gpu_hungarian import (
+            linear_sum_assignment_batch,
+        )
+        assigner = self.assigner
+        all_costs = []
+        meta = []
+        num_dec_layers = len(all_cls_scores)
+        for layer_i, (cls_scores, bbox_preds) in enumerate(
+                zip(all_cls_scores, all_bbox_preds)):
+            num_imgs = cls_scores.size(0)
+            for img_i in range(num_imgs):
+                bbox_pred = bbox_preds[img_i].detach()
+                cls_score = cls_scores[img_i].detach()
+                gt_bboxes = gt_bboxes_list[img_i]
+                gt_labels = gt_labels_list[img_i]
+                num_gts, num_bboxes = gt_bboxes.size(0), bbox_pred.size(0)
+                if num_gts == 0 or num_bboxes == 0:
+                    meta.append((layer_i, img_i, bbox_pred, gt_bboxes,
+                                 gt_labels, None))
+                    continue
+                cost = assigner.compute_match_cost(
+                    bbox_pred, cls_score, gt_bboxes, gt_labels)
+                all_costs.append(cost.detach())
+                meta.append((layer_i, img_i, bbox_pred, gt_bboxes, gt_labels,
+                             len(all_costs) - 1))
+
+        pairs = linear_sum_assignment_batch(all_costs) if all_costs else []
+
+        layer_assigns = [[] for _ in range(num_dec_layers)]
+        for layer_i, (cls_scores, bbox_preds) in enumerate(
+                zip(all_cls_scores, all_bbox_preds)):
+            num_imgs = cls_scores.size(0)
+            for _ in range(num_imgs):
+                layer_assigns[layer_i].append(None)
+
+        for layer_i, img_i, bbox_pred, gt_bboxes, gt_labels, cost_idx in meta:
+            if cost_idx is None:
+                layer_assigns[layer_i][img_i] = self._build_assign_result(
+                    bbox_pred, gt_bboxes, gt_labels,
+                    bbox_pred.new_zeros(0, dtype=torch.long),
+                    bbox_pred.new_zeros(0, dtype=torch.long))
+            else:
+                row_inds, col_inds = pairs[cost_idx]
+                layer_assigns[layer_i][img_i] = self._build_assign_result(
+                    bbox_pred, gt_bboxes, gt_labels, row_inds, col_inds)
+
+        losses_cls, losses_bbox = [], []
+        for layer_i in range(num_dec_layers):
+            lc, lb = self._loss_single_with_assigns(
+                all_cls_scores[layer_i], all_bbox_preds[layer_i],
+                layer_assigns[layer_i], gt_bboxes_list, gt_labels_list)
+            losses_cls.append(lc)
+            losses_bbox.append(lb)
+        return losses_cls, losses_bbox
 
     def get_targets(self,
                     cls_scores_list,
@@ -347,11 +646,12 @@ class BEVFormerHead(DETRHead):
                 a single decoder layer.
         """
         num_imgs = cls_scores.size(0)
-        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
-        bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
-        cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
-                                           gt_bboxes_list, gt_labels_list,
-                                           gt_bboxes_ignore_list)
+        with torch.no_grad():
+            cls_scores_list = [cls_scores[i].detach() for i in range(num_imgs)]
+            bbox_preds_list = [bbox_preds[i].detach() for i in range(num_imgs)]
+            cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
+                                            gt_bboxes_list, gt_labels_list,
+                                            gt_bboxes_ignore_list)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
         labels = torch.cat(labels_list, 0)
@@ -368,14 +668,16 @@ class BEVFormerHead(DETRHead):
             cls_avg_factor = reduce_mean(
                 cls_scores.new_tensor([cls_avg_factor]))
 
-        cls_avg_factor = max(cls_avg_factor, 1)
+        if torch.is_tensor(cls_avg_factor):
+            cls_avg_factor = torch.clamp(cls_avg_factor, min=1.0)
+        else:
+            cls_avg_factor = max(cls_avg_factor, 1)
         loss_cls = self.loss_cls(
             cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
 
-        # Compute the average number of gt boxes accross all gpus, for
-        # normalization purposes
-        num_total_pos = loss_cls.new_tensor([num_total_pos])
-        num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
+        # Keep avg_factor on device to avoid host sync in the loss window.
+        bbox_avg_factor = torch.clamp(
+            reduce_mean(loss_cls.new_tensor([float(num_total_pos)])), min=1.0)
 
         # regression L1 loss
         bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
@@ -386,7 +688,7 @@ class BEVFormerHead(DETRHead):
         loss_bbox = self.loss_bbox(
             bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan,
                                                                :10], bbox_weights[isnotnan, :10],
-            avg_factor=num_total_pos)
+            avg_factor=bbox_avg_factor)
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
             loss_cls = torch.nan_to_num(loss_cls)
             loss_bbox = torch.nan_to_num(loss_bbox)
@@ -438,9 +740,8 @@ class BEVFormerHead(DETRHead):
         num_dec_layers = len(all_cls_scores)
         device = gt_labels_list[0].device
 
-        gt_bboxes_list = [torch.cat(
-            (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
-            dim=1).to(device) for gt_bboxes in gt_bboxes_list]
+        gt_bboxes_list, gt_labels_list = self._preprocess_gt_batch(
+            gt_bboxes_list, gt_labels_list, device)
 
         all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
         all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
@@ -448,10 +749,14 @@ class BEVFormerHead(DETRHead):
             gt_bboxes_ignore for _ in range(num_dec_layers)
         ]
 
-        losses_cls, losses_bbox = multi_apply(
-            self.loss_single, all_cls_scores, all_bbox_preds,
-            all_gt_bboxes_list, all_gt_labels_list,
-            all_gt_bboxes_ignore_list)
+        if getattr(self.assigner, 'merge_hungarian_all_layers', False):
+            losses_cls, losses_bbox = self._loss_all_layers_merged(
+                all_cls_scores, all_bbox_preds, gt_bboxes_list, gt_labels_list)
+        else:
+            losses_cls, losses_bbox = multi_apply(
+                self.loss_single, all_cls_scores, all_bbox_preds,
+                all_gt_bboxes_list, all_gt_labels_list,
+                all_gt_bboxes_ignore_list)
 
         loss_dict = dict()
         # loss of proposal generated from encode feature map.
@@ -520,7 +825,7 @@ class BEVFormerHead_GroupDETR(BEVFormerHead):
         kwargs['num_query'] = group_detr * kwargs['num_query']
         super().__init__(*args, **kwargs)
 
-    def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False):
+    def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False, **kwargs):
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
         object_query_embeds = self.query_embedding.weight.to(dtype)
@@ -543,6 +848,7 @@ class BEVFormerHead_GroupDETR(BEVFormerHead):
                 bev_pos=bev_pos,
                 img_metas=img_metas,
                 prev_bev=prev_bev,
+                **kwargs
             )
         else:
             outputs = self.transformer(
@@ -641,14 +947,13 @@ class BEVFormerHead_GroupDETR(BEVFormerHead):
         all_bbox_preds = preds_dicts['all_bbox_preds']
         enc_cls_scores = preds_dicts['enc_cls_scores']
         enc_bbox_preds = preds_dicts['enc_bbox_preds']
-        assert enc_cls_scores is None and enc_bbox_preds is None 
+        assert enc_cls_scores is None and enc_bbox_preds is None
 
         num_dec_layers = len(all_cls_scores)
         device = gt_labels_list[0].device
 
-        gt_bboxes_list = [torch.cat(
-            (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
-            dim=1).to(device) for gt_bboxes in gt_bboxes_list]
+        gt_bboxes_list, gt_labels_list = self._preprocess_gt_batch(
+            gt_bboxes_list, gt_labels_list, device)
 
         all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
         all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]

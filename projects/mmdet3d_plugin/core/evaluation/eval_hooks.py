@@ -88,4 +88,9 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
             if self.save_best:
                 self._save_ckpt(runner, key_score)
-  
+
+        # Rank0 NuScenes metric can take many minutes. Without a barrier,
+        # other ranks return early and may enter the next train epoch's
+        # DDP all_reduce while rank0 is still evaluating → MCCL timeout /
+        # GPU hang (MUSA_ERROR_LAUNCH_TIMEOUT). Wait until all ranks finish.
+        dist.barrier()

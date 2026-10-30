@@ -95,6 +95,9 @@ class CustomNuScenesMonoDataset(CocoDataset):
         if self.eval_version is not None:
             from nuscenes.eval.detection.config import config_factory
             self.eval_detection_configs = config_factory(self.eval_version)
+            print(self.eval_version)
+            print(self.eval_detection_configs)
+            raise Exception("error")
         if self.modality is None:
             self.modality = dict(
                 use_camera=True,
@@ -766,11 +769,11 @@ def nusc_box_to_cam_box3d(boxes):
     dims[:, [0, 1, 2]] = dims[:, [1, 2, 0]]
     rots = -rots
 
-    boxes_3d = torch.cat([locs, dims, rots, velocity], dim=1).cuda()
+    boxes_3d = torch.cat([locs, dims, rots, velocity], dim=1).musa()
     cam_boxes3d = CameraInstance3DBoxes(
         boxes_3d, box_dim=9, origin=(0.5, 0.5, 0.5))
-    scores = torch.Tensor([b.score for b in boxes]).cuda()
-    labels = torch.LongTensor([b.label for b in boxes]).cuda()
+    scores = torch.Tensor([b.score for b in boxes]).musa()
+    labels = torch.LongTensor([b.label for b in boxes]).musa()
     nms_scores = scores.new_zeros(scores.shape[0], 10 + 1)
     indices = labels.new_tensor(list(range(scores.shape[0])))
     nms_scores[indices, labels] = scores

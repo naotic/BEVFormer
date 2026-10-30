@@ -38,7 +38,7 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         self.pre_pipeline(input_dict)
         example = self.pipeline(input_dict)
         data_queue[0] = example
-        
+
         for frame_idx in self.frames:
             chosen_idx = index + frame_idx
             if frame_idx ==0 or chosen_idx <0 or chosen_idx >= len(self.data_infos):
@@ -54,7 +54,7 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         ret = defaultdict(list)
         for i in range(len(data_queue[0]['img'])):
             single_aug_data_queue = {}
-            for t in data_queue.keys():
+            for t in list(data_queue.keys()):
                 single_example = {}
                 for key ,value in data_queue[t].items():
                     single_example[key] = value[i]
@@ -77,7 +77,7 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         data_queue = OrderedDict()
         input_dict = self.get_data_info(index)
         if input_dict is None:
-            return None 
+            return None
         cur_scene_token = input_dict['scene_token']
         # cur_frame_idx = input_dict['frame_idx']
         ann_info = copy.deepcopy(input_dict['ann_info'])
@@ -88,7 +88,7 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
             return None
         data_queue[0] = example
         aug_param = copy.deepcopy(example['aug_param']) if 'aug_param' in example else {}
-        
+
         # frame_idx_to_idx = self.scene_to_frame_idx_to_idx[cur_scene_token]
         for frame_idx in self.frames:
             chosen_idx = index + frame_idx
@@ -97,7 +97,7 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
             info = self.data_infos[chosen_idx]
             input_dict = self.prepare_input_dict(info)
             if input_dict['scene_token'] == cur_scene_token:
-                input_dict['ann_info'] = copy.deepcopy(ann_info) # only for pipeline, should never be used 
+                input_dict['ann_info'] = copy.deepcopy(ann_info) # only for pipeline, should never be used
                 self.pre_pipeline(input_dict)
                 input_dict['aug_param'] = copy.deepcopy(aug_param)
                 example = self.pipeline(input_dict)

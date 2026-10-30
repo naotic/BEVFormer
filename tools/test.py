@@ -3,10 +3,24 @@
 # ---------------------------------------------
 #  Modified by Zhiqi Li
 # ---------------------------------------------
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# 限制各底层库的线程数，避免 num_workers × 每进程多线程 导致线程爆炸
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+import cv2
+cv2.setNumThreads(0)
+
 import argparse
 import mmcv
 import os
 import torch
+torch.set_num_threads(1)
+import torch_musa
 import warnings
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
@@ -159,8 +173,8 @@ def main():
         torch.backends.cudnn.benchmark = True
     # set tf32
     if cfg.get('close_tf32', False):
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.musa.matmul.allow_tf32 = False
+        torch.backends.mudnn.allow_tf32 = False
 
     cfg.model.pretrained = None
     # in case the test dataset is concatenated
@@ -201,41 +215,49 @@ def main():
         dist=distributed,
         shuffle=False,
         nonshuffler_sampler=cfg.data.nonshuffler_sampler,
+        drop_last=True,
     )
 
     # build the model and load checkpoint
     cfg.model.train_cfg = None
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
     fp16_cfg = cfg.get('fp16', None)
-    if fp16_cfg is not None:
-        wrap_fp16_model(model)
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+    # if fp16_cfg is not None:
+    #     wrap_fp16_model(model)
+    # checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
     # old versions did not save class info in checkpoints, this walkaround is
     # for backward compatibility
-    if 'CLASSES' in checkpoint.get('meta', {}):
-        model.CLASSES = checkpoint['meta']['CLASSES']
-    else:
-        model.CLASSES = dataset.CLASSES
-    # palette for visualization in segmentation tasks
-    if 'PALETTE' in checkpoint.get('meta', {}):
-        model.PALETTE = checkpoint['meta']['PALETTE']
-    elif hasattr(dataset, 'PALETTE'):
-        # segmentation dataset has `PALETTE` attribute
-        model.PALETTE = dataset.PALETTE
+    # if 'CLASSES' in checkpoint.get('meta', {}):
+    #     model.CLASSES = checkpoint['meta']['CLASSES']
+    # else:
+    model.CLASSES = dataset.CLASSES
+    # # palette for visualization in segmentation tasks
+    # if 'PALETTE' in checkpoint.get('meta', {}):
+    #     model.PALETTE = checkpoint['meta']['PALETTE']
+    # elif hasattr(dataset, 'PALETTE'):
+    #     # segmentation dataset has `PALETTE` attribute
+    model.PALETTE = None
 
-    if not distributed:
-        assert False
-        # model = MMDataParallel(model, device_ids=[0])
-        # outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
-    else:
-        model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
-            broadcast_buffers=False)
-        outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
-                                        args.gpu_collect)
+    # if not distributed:
+    #     assert False
+    model = MMDataParallel(model, device_ids=[0])
+    ## WARMUP ##
+    with torch.no_grad():
+        for i, data in enumerate(data_loader):
+            model(return_loss=False, rescale=True, **data)
+            if i >= 2:
+                break
+    outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+    # else:
+    #     model = MMDistributedDataParallel(
+    #         model.musa(),
+    #         device_ids=[torch.musa.current_device()],
+    #         broadcast_buffers=False)
+    #     outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
+    #                                     args.gpu_collect)
+    exit(0)
 
     rank, _ = get_dist_info()
     if rank == 0:

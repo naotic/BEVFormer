@@ -5,6 +5,8 @@
 # ---------------------------------------------
 
 import torch
+import torch.distributed as dist
+from collections import OrderedDict
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
@@ -54,6 +56,21 @@ class BEVFormer(MVXTwoStageDetector):
         self.use_grid_mask = use_grid_mask
         self.fp16_enabled = False
 
+        # Run the image backbone + neck in channels_last (NHWC) so muDNN uses
+        # the faster NHWC conv path (1.1-2.8x per conv, ~7% end-to-end with the
+        # fuse_c DCN + channels_last-aware 1x1 patch). Convert the conv weights
+        # once here; extract_img_feat only matches the per-call input. Gated by
+        # env (default ON) for easy A/B; ENABLE_BACKBONE_CL=0 disables.
+        import os
+        self.use_backbone_cl = os.environ.get(
+            "ENABLE_BACKBONE_CL", "true").lower() in ("1", "true", "yes", "on")
+        if self.use_backbone_cl:
+            self.img_backbone = self.img_backbone.to(
+                memory_format=torch.channels_last)
+            if self.with_img_neck:
+                self.img_neck = self.img_neck.to(
+                    memory_format=torch.channels_last)
+
         # temporal
         self.video_test_mode = video_test_mode
         self.prev_frame_info = {
@@ -63,12 +80,18 @@ class BEVFormer(MVXTwoStageDetector):
             'prev_angle': 0,
         }
 
-
     def extract_img_feat(self, img, img_metas, len_queue=None):
         """Extract features of images."""
+        from mmcv.parallel import DataContainer
+        if isinstance(img, DataContainer) and isinstance(img.data, list):
+            img = img.data[0].to()
+        target_device = next(self.img_backbone.parameters()).device
+        target_dtype = next(self.img_backbone.parameters()).dtype
+        img = img.to(target_device).to(target_dtype)
+
         B = img.size(0)
         if img is not None:
-            
+
             # input_shape = img.shape[-2:]
             # # update real input shape of each single img
             # for img_meta in img_metas:
@@ -82,6 +105,12 @@ class BEVFormer(MVXTwoStageDetector):
             if self.use_grid_mask:
                 img = self.grid_mask(img)
 
+            # Match the input's memory format to the backbone weights (converted
+            # to channels_last once in __init__); feats are restored to
+            # NCHW-contiguous after the neck for the downstream reshape.
+            if self.use_backbone_cl:
+                img = img.to(memory_format=torch.channels_last)
+
             img_feats = self.img_backbone(img)
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
@@ -89,6 +118,8 @@ class BEVFormer(MVXTwoStageDetector):
             return None
         if self.with_img_neck:
             img_feats = self.img_neck(img_feats)
+        if self.use_backbone_cl:
+            img_feats = [f.contiguous() for f in img_feats]
 
         img_feats_reshaped = []
         for img_feat in img_feats:
@@ -104,7 +135,7 @@ class BEVFormer(MVXTwoStageDetector):
         """Extract features from images and points."""
 
         img_feats = self.extract_img_feat(img, img_metas, len_queue=len_queue)
-        
+
         return img_feats
 
 
@@ -154,7 +185,7 @@ class BEVFormer(MVXTwoStageDetector):
             return self.forward_train(**kwargs)
         else:
             return self.forward_test(**kwargs)
-    
+
     def obtain_history_bev(self, imgs_queue, img_metas_list):
         """Obtain history BEV features iteratively. To save GPU memory, gradients are not calculated.
         """
@@ -175,6 +206,42 @@ class BEVFormer(MVXTwoStageDetector):
                     img_feats, img_metas, prev_bev, only_bev=True)
             self.train()
             return prev_bev
+
+    def _parse_losses(self, losses):
+        """Batched cross-GPU reduction of log scalars.
+
+        Identical values to mmdet's BaseDetector._parse_losses (each scalar is
+        the world-size mean), but stacks all log scalars into ONE all_reduce +
+        ONE .item() host sync instead of N. The backward ``loss`` is the local
+        sum of loss-keyed values (NOT reduced), exactly as upstream -> training
+        math is unchanged.
+        """
+        log_vars = OrderedDict()
+        for loss_name, loss_value in losses.items():
+            if isinstance(loss_value, torch.Tensor):
+                log_vars[loss_name] = loss_value.mean()
+            elif isinstance(loss_value, list):
+                log_vars[loss_name] = sum(_loss.mean() for _loss in loss_value)
+            else:
+                raise TypeError(
+                    f'{loss_name} is not a tensor or list of tensors')
+
+        loss = sum(_value for _key, _value in log_vars.items()
+                   if 'loss' in _key)
+        log_vars['loss'] = loss
+
+        if dist.is_available() and dist.is_initialized():
+            keys = list(log_vars.keys())
+            stacked = torch.stack([log_vars[k] for k in keys])
+            dist.all_reduce(stacked)
+            stacked.div_(dist.get_world_size())
+            for i, key in enumerate(keys):
+                log_vars[key] = stacked[i].item()
+        else:
+            for key in log_vars:
+                log_vars[key] = log_vars[key].item()
+
+        return loss, log_vars
 
     @auto_fp16(apply_to=('img', 'points'))
     def forward_train(self,
@@ -213,7 +280,7 @@ class BEVFormer(MVXTwoStageDetector):
         Returns:
             dict: Losses of different branches.
         """
-        
+
         len_queue = img.size(1)
         prev_img = img[:, :-1, ...]
         img = img[:, -1, ...]
@@ -239,6 +306,10 @@ class BEVFormer(MVXTwoStageDetector):
                 raise TypeError('{} must be a list, but got {}'.format(
                     name, type(var)))
         img = [img] if img is None else img
+
+        from mmcv.parallel import DataContainer
+        if isinstance(img_metas, list) and isinstance(img_metas[0], DataContainer):
+            img_metas = img_metas[0].data
 
         if img_metas[0][0]['scene_token'] != self.prev_frame_info['scene_token']:
             # the first sample of each scene is truncated

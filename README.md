@@ -1,3 +1,5 @@
+> **MUSA 客户运行入口：** [README_MUSA.md](README_MUSA.md)（使用已交付镜像中的运行依赖）
+
 <div align="center">   
   
 # BEVFormer: a Cutting-edge Baseline for Camera-based Detection

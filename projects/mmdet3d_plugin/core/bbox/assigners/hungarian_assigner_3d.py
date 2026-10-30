@@ -5,12 +5,15 @@ from mmdet.core.bbox.assigners import AssignResult
 from mmdet.core.bbox.assigners import BaseAssigner
 from mmdet.core.bbox.match_costs import build_match_cost
 from mmdet.models.utils.transformer import inverse_sigmoid
+from projects.mmdet3d_plugin.core.bbox.assigners.gpu_hungarian import (
+    linear_sum_assignment as gpu_linear_sum_assignment,
+)
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
 
 try:
-    from scipy.optimize import linear_sum_assignment
+    from scipy.optimize import linear_sum_assignment as scipy_linear_sum_assignment
 except ImportError:
-    linear_sum_assignment = None
+    scipy_linear_sum_assignment = None
 
 
 @BBOX_ASSIGNERS.register_module()
@@ -43,16 +46,30 @@ class HungarianAssigner3D(BaseAssigner):
                  cls_cost=dict(type='ClassificationCost', weight=1.),
                  reg_cost=dict(type='BBoxL1Cost', weight=1.0),
                  iou_cost=dict(type='IoUCost', weight=0.0),
-                 pc_range=None):
+                 pc_range=None,
+                 use_gpu_hungarian=False,
+                 use_device_hungarian=False,
+                 merge_hungarian_all_layers=False):
         self.cls_cost = build_match_cost(cls_cost)
         self.reg_cost = build_match_cost(reg_cost)
         self.iou_cost = build_match_cost(iou_cost)
         self.pc_range = pc_range
+        self.use_gpu_hungarian = use_gpu_hungarian
+        self.use_device_hungarian = use_device_hungarian
+        self.merge_hungarian_all_layers = merge_hungarian_all_layers
+
+    def compute_match_cost(self, bbox_pred, cls_pred, gt_bboxes, gt_labels):
+        """Weighted cls + reg match cost (compile-friendly sub-graph)."""
+        cls_cost = self.cls_cost(cls_pred, gt_labels)
+        normalized_gt_bboxes = normalize_bbox(gt_bboxes, self.pc_range)
+        reg_cost = self.reg_cost(
+            bbox_pred[:, :8], normalized_gt_bboxes[:, :8])
+        return cls_cost + reg_cost
 
     def assign(self,
                bbox_pred,
                cls_pred,
-               gt_bboxes, 
+               gt_bboxes,
                gt_labels,
                gt_bboxes_ignore=None,
                eps=1e-7):
@@ -103,28 +120,25 @@ class HungarianAssigner3D(BaseAssigner):
             return AssignResult(
                 num_gts, assigned_gt_inds, None, labels=assigned_labels)
 
-        # 2. compute the weighted costs
-        # classification and bboxcost.
-        cls_cost = self.cls_cost(cls_pred, gt_labels)
-        # regression L1 cost
-       
-        normalized_gt_bboxes = normalize_bbox(gt_bboxes, self.pc_range)
-    
-        reg_cost = self.reg_cost(bbox_pred[:, :8], normalized_gt_bboxes[:, :8])
-      
-        # weighted sum of above two costs
-        cost = cls_cost + reg_cost
-        
-        # 3. do Hungarian matching on CPU using linear_sum_assignment
-        cost = cost.detach().cpu()
-        if linear_sum_assignment is None:
-            raise ImportError('Please run "pip install scipy" '
-                              'to install scipy first.')
-        matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
-        matched_row_inds = torch.from_numpy(matched_row_inds).to(
-            bbox_pred.device)
-        matched_col_inds = torch.from_numpy(matched_col_inds).to(
-            bbox_pred.device)
+        cost = self.compute_match_cost(
+            bbox_pred, cls_pred, gt_bboxes, gt_labels)
+
+        # 3. Hungarian matching
+        if self.use_device_hungarian or self.use_gpu_hungarian:
+            matched_row_inds, matched_col_inds = gpu_linear_sum_assignment(
+                cost.detach(),
+                use_device=self.use_device_hungarian)
+        else:
+            cost_cpu = cost.detach().cpu()
+            if scipy_linear_sum_assignment is None:
+                raise ImportError('Please run "pip install scipy" '
+                                  'to install scipy first.')
+            matched_row_inds, matched_col_inds = scipy_linear_sum_assignment(
+                cost_cpu)
+            matched_row_inds = torch.from_numpy(matched_row_inds).to(
+                bbox_pred.device)
+            matched_col_inds = torch.from_numpy(matched_col_inds).to(
+                bbox_pred.device)
 
         # 4. assign backgrounds and foregrounds
         # assign all indices to backgrounds first

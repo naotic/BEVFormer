@@ -8,6 +8,7 @@ import warnings
 
 import numpy as np
 import torch
+import torch_musa
 import torch.distributed as dist
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
@@ -25,6 +26,7 @@ import os.path as osp
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.core.evaluation.eval_hooks import CustomDistEvalHook
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
+from projects.mmdet3d_plugin.utils.prefetcher import PrefetchConfig, PrefetchLoader
 def custom_train_detector(model,
                    dataset,
                    cfg,
@@ -36,8 +38,18 @@ def custom_train_detector(model,
     logger = get_root_logger(cfg.log_level)
 
     # prepare data loaders
-   
+
     dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
+
+    for ds in dataset:
+        for k, v in ds.__dict__.items():
+            if 'DetectionConfig' in str(type(v)):
+                print("FOUND in dataset:", k, type(v))
+
+
+
+
+
     #assert len(dataset)==1s
     if 'imgs_per_gpu' in cfg.data:
         logger.warning('"imgs_per_gpu" is deprecated in MMDet V2.0. '
@@ -53,6 +65,11 @@ def custom_train_detector(model,
                 f'{cfg.data.imgs_per_gpu} in this experiments')
         cfg.data.samples_per_gpu = cfg.data.imgs_per_gpu
 
+    dataloader_kwargs = {}
+    for k in ('pin_memory', 'prefetch_factor', 'persistent_workers'):
+        if k in cfg.data:
+            dataloader_kwargs[k] = cfg.data.get(k)
+
     data_loaders = [
         build_dataloader(
             ds,
@@ -64,31 +81,41 @@ def custom_train_detector(model,
             seed=cfg.seed,
             shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
             nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
+            **dataloader_kwargs,
         ) for ds in dataset
     ]
 
+    if cfg.data.get('enable_musa_prefetch', False):
+        # data_loaders = [PrefetchLoader(dl, config=PrefetchConfig(non_blocking=True)) for dl in data_loaders]
+        data_loaders = [
+            PrefetchLoader(
+                dl,
+                config=PrefetchConfig(non_blocking=True, pin_cpu_batch=False),
+            )
+            for dl in data_loaders
+        ]
     # put model on gpus
     if distributed:
         find_unused_parameters = cfg.get('find_unused_parameters', False)
         # Sets the `find_unused_parameters` parameter in
         # torch.nn.parallel.DistributedDataParallel
         model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
+            model.musa(),
+            device_ids=[torch.musa.current_device()],
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters)
         if eval_model is not None:
             eval_model = MMDistributedDataParallel(
-                eval_model.cuda(),
-                device_ids=[torch.cuda.current_device()],
+                eval_model.musa(),
+                device_ids=[torch.musa.current_device()],
                 broadcast_buffers=False,
                 find_unused_parameters=find_unused_parameters)
     else:
         model = MMDataParallel(
-            model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+            model.musa(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
         if eval_model is not None:
             eval_model = MMDataParallel(
-                eval_model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+                eval_model.musa(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
 
 
     # build runner
@@ -142,12 +169,12 @@ def custom_train_detector(model,
     runner.register_training_hooks(cfg.lr_config, optimizer_config,
                                    cfg.checkpoint_config, cfg.log_config,
                                    cfg.get('momentum_config', None))
-    
+
     # register profiler hook
     #trace_config = dict(type='tb_trace', dir_name='work_dir')
     #profiler_config = dict(on_trace_ready=trace_config)
     #runner.register_profiler_hook(profiler_config)
-    
+
     if distributed:
         if isinstance(runner, EpochBasedRunner):
             runner.register_hook(DistSamplerSeedHook())
@@ -171,6 +198,7 @@ def custom_train_detector(model,
             shuffle=False,
             shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
             nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
+            **dataloader_kwargs,
         )
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
@@ -196,5 +224,5 @@ def custom_train_detector(model,
         runner.resume(cfg.resume_from)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
-    runner.run(data_loaders, cfg.workflow)
 
+    runner.run(data_loaders, cfg.workflow)

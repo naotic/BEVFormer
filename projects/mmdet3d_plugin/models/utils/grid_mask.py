@@ -45,7 +45,7 @@ class Grid(object):
                 s = d*i + st_w
                 t = min(s+self.l, ww)
                 mask[:,s:t] *= 0
-       
+
         r = np.random.randint(self.rotate)
         mask = Image.fromarray(np.uint8(mask))
         mask = mask.rotate(r)
@@ -62,7 +62,7 @@ class Grid(object):
             offset = (1 - mask) * offset
             img = img * mask + offset
         else:
-            img = img * mask 
+            img = img * mask
 
         return img, label
 
@@ -81,6 +81,7 @@ class GridMask(nn.Module):
         self.fp16_enable = False
     def set_prob(self, epoch, max_epoch):
         self.prob = self.st_prob * epoch / max_epoch #+ 1.#0.5
+
     @auto_fp16()
     def forward(self, x):
         if np.random.rand() > self.prob or not self.training:
@@ -104,21 +105,67 @@ class GridMask(nn.Module):
                 s = d*i + st_w
                 t = min(s+self.l, ww)
                 mask[:,s:t] *= 0
-       
+
         r = np.random.randint(self.rotate)
         mask = Image.fromarray(np.uint8(mask))
         mask = mask.rotate(r)
         mask = np.asarray(mask)
         mask = mask[(hh-h)//2:(hh-h)//2+h, (ww-w)//2:(ww-w)//2+w]
 
-        mask = torch.from_numpy(mask).to(x.dtype).cuda()
+        mask = torch.from_numpy(mask.copy()).to(x.dtype).musa()
         if self.mode == 1:
             mask = 1-mask
         mask = mask.expand_as(x)
         if self.offset:
-            offset = torch.from_numpy(2 * (np.random.rand(h,w) - 0.5)).to(x.dtype).cuda()
+            offset = torch.from_numpy(2 * (np.random.rand(h,w) - 0.5)).to(x.dtype).musa()
             x = x * mask + offset * (1 - mask)
         else:
-            x = x * mask 
-        
+            x = x * mask
         return x.view(n,c,h,w)
+
+        # assert self.rotate == 1 and self.use_h == True and self.use_w == True
+        # if np.random.rand() > self.prob or not self.training:
+        #     return x
+
+        # x = x.contiguous()
+        # n, c, h, w = x.size()
+        # x_flat = x.view(-1, h, w)
+
+        # hh = int(1.5 * h)
+        # ww = int(1.5 * w)
+
+        # d = np.random.randint(2, h)
+        # l = min(max(int(d * self.ratio + 0.5), 1), d - 1)
+        # self.l = l
+
+        # st_h = np.random.randint(d)
+        # st_w = np.random.randint(d)
+
+        # rows = torch.arange(hh, device=x.device)
+        # cols = torch.arange(ww, device=x.device)
+
+        # row_drop = ((rows - st_h) % d) < l
+        # col_drop = ((cols - st_w) % d) < l
+
+        # mask_h = (~row_drop).to(dtype=x.dtype)[:, None]
+        # mask_w = (~col_drop).to(dtype=x.dtype)[None, :]
+
+        # # 原逻辑是先横条置 0，再竖条置 0，所以等价于相乘
+        # mask_big = mask_h * mask_w
+
+        # top = (hh - h) // 2
+        # left = (ww - w) // 2
+        # mask = mask_big[top:top + h, left:left + w]
+
+        # if self.mode == 1:
+        #     mask = 1 - mask
+
+        # mask = mask.expand_as(x_flat)
+
+        # if self.offset:
+        #     offset = 2 * torch.rand((h, w), device=x.device, dtype=x.dtype) - 1
+        #     x_flat = x_flat * mask + offset * (1 - mask)
+        # else:
+        #     x_flat = x_flat * mask
+
+        # return x_flat.view(n, c, h, w)

@@ -49,7 +49,8 @@ model = dict(
         norm_cfg=dict(type='BN2d', requires_grad=False),
         norm_eval=True,
         style='caffe',
-        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False), # original DCNv2 will print log when perform load_state_dict
+        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False,
+                 backend='fuse_c'), # DCN 后端直接在此指定：'fuse_c'(融合NHWC,默认)|'cuda'(原始im2col)|'tilelang'
         stage_with_dcn=(False, False, True, True)),
     img_neck=dict(
         type='FPN',
@@ -157,10 +158,17 @@ model = dict(
             cls_cost=dict(type='FocalLossCost', weight=2.0),
             reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
             iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head.
-            pc_range=point_cloud_range))))
+            pc_range=point_cloud_range,
+            # H2D/sync optimization: matching still uses scipy (use_device_hungarian
+            # left False), so the assignment is byte-identical to the baseline.
+            # use_gpu_hungarian batches the cost D2H copy; merge_hungarian_all_layers
+            # solves all decoder layers' LAPs in ONE stacked D2H + parallel scipy
+            # (12 D2H syncs/iter -> 1). Precision-identical, fewer host syncs.
+            use_gpu_hungarian=True,
+            merge_hungarian_all_layers=True))))
 
 dataset_type = 'CustomNuScenesDataset'
-data_root = 'data/nuscenes/'
+data_root = './data/nuscenes/'
 file_client_args = dict(backend='disk')
 
 
@@ -195,8 +203,14 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=1,
+    samples_per_gpu=3,
     workers_per_gpu=4,
+    # DataLoader perf knobs (consumed by projects/mmdet3d_plugin/datasets/builder.py
+    # and projects/mmdet3d_plugin/bevformer/apis/mmdet_train.py)
+    pin_memory=True,
+    prefetch_factor=2,
+    persistent_workers=True,
+    enable_musa_prefetch=True,
     train=dict(
         type=dataset_type,
         data_root=data_root,
@@ -243,15 +257,51 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
 total_epochs = 24
-evaluation = dict(interval=1, pipeline=test_pipeline)
+evaluation = dict(interval=24, pipeline=test_pipeline)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-load_from = 'ckpts/r101_dcn_fcos3d_pretrain.pth'
+load_from = './ckpts/r101_dcn_fcos3d_pretrain.pth'
 log_config = dict(
     interval=50,
     hooks=[
-        dict(type='TextLoggerHook'),
+        dict(type='EpochTimeTextLoggerHook'),
         dict(type='TensorboardLoggerHook')
     ])
 
-checkpoint_config = dict(interval=1)
+custom_hooks = [
+    dict(type='EpochIterTimerHook', priority='VERY_LOW')
+]
+
+checkpoint_config = dict(interval=24)
+
+
+# ============================================================================
+# 优化开关（单 config 完成每个优化的试验，无需环境变量）
+# train.py 在导入 plugin 前把这些映射成对应 env（见 tools/bev_opt_setup.py），
+# 故所有现有门控代码由此驱动。改这里逐项开/关即可做 A/B；全部置 False 即回到原始基线。
+# 本仓库已 cherry-pick 的优化：frozen_bn / conv_epilogue / ffn_gemm_relu /
+# msda_col2im_smem / backbone_channels_last / dcn_recompute_cols。
+# ============================================================================
+bev_opt = dict(
+    frozen_bn=True,                # backbone BN 冻结为固定仿射（精度已验证）
+    conv_epilogue=True,            # conv+BN+relu+add 融进 muDNN epilogue（需 frozen_bn）
+    conv_bn_fuse=True,             # 优化1：downsample 分支 conv+BN（无 relu）融进 muDNN epilogue（需 conv_epilogue）
+    dcn_gemm_bn_relu=True,         # 优化2：DCN 主 GEMM + BN + relu 融进 muBLAS epilogue（需 conv_epilogue + dcn.backend='fuse_c'）
+    ffn_gemm_relu=True,            # FFN Linear+ReLU 走 muDNN GEMM-RELU 融合
+    msda_col2im_smem=True,         # MSDA col2im 反向走 msda_musa_opt2 smem-reduce 内核（1.94x）
+    backbone_channels_last=True,   # backbone+neck NHWC(channels_last)
+    dcn_recompute_cols=True,       # DCN 反向重算 Col 省显存（配合 dcn.backend='fuse_c'）
+    # 注：DCN 后端('fuse_c'/'cuda'/'tilelang') 直接写在 model.img_backbone.dcn.backend
+)
+
+# profiler_config = dict(
+#     by_epoch=False,
+#     profile_iters=50,
+#     activities=['cpu', 'musa'],
+#     schedule=dict(wait=5, warmup=5, active=3, repeat=1),
+#     on_trace_ready=dict(type='tb_trace', dir_name='./trace_log'),
+#     record_shapes=True,
+#     profile_memory=False,
+#     with_stack=True,
+#     with_flops=True,
+# )

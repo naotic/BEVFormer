@@ -72,11 +72,12 @@ class GenericBoxes3D():
         return self._tvec
 
     @property
-    @amp.autocast(enabled=False)
+    # @amp.autocast(enabled=False)
+    @torch.amp.autocast('musa', enabled=False)
     def corners(self):
-        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        allow_tf32 = torch.backends.musa.matmul.allow_tf32
+        torch.backends.musa.matmul.allow_tf32 = False
+        torch.backends.mudnn.allow_tf32 = False
 
         translation = t3d.Translate(self.tvec, device=self.device)
 
@@ -91,8 +92,8 @@ class GenericBoxes3D():
         corners_in_obj_frame = lwh.unsqueeze(1) * _corners.unsqueeze(0)
 
         corners3d = tfm.transform_points(corners_in_obj_frame)
-        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.backends.musa.matmul.allow_tf32 = allow_tf32
+        torch.backends.mudnn.allow_tf32 = allow_tf32
         return corners3d
 
     @classmethod
