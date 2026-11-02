@@ -201,12 +201,10 @@ class PerceptionTransformer(BaseModule):
             feat_flatten.append(feat)
 
         feat_flatten = torch.cat(feat_flatten, 2)
-        # spatial_shapes = torch.as_tensor(
-        #     spatial_shapes, dtype=torch.long, device=bev_pos.device)
-        # level_start_index = torch.cat((spatial_shapes.new_zeros(
-        #     (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-        spatial_shapes = self.cached_spatial_shapes
-        level_start_index = self.cached_level_start_index
+        spatial_shapes = torch.as_tensor(
+            spatial_shapes, dtype=torch.long, device=bev_pos.device)
+        level_start_index = torch.cat((spatial_shapes.new_zeros(
+            (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         # print(spatial_shapes)
         # print(level_start_index)
 

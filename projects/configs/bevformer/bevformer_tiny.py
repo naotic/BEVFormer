@@ -164,6 +164,8 @@ model = dict(
         out_size_factor=4,
         assigner=dict(
             type='HungarianAssigner3D',
+            use_gpu_hungarian=True,  # Batch costs/copies; CPU assignment remains the default.
+            merge_hungarian_all_layers=True,
             cls_cost=dict(type='FocalLossCost', weight=2.0),
             reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
             iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head.
@@ -190,7 +192,7 @@ train_pipeline = [
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-   
+
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1600, 900),
@@ -210,6 +212,10 @@ test_pipeline = [
 data = dict(
     samples_per_gpu=1,
     workers_per_gpu=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+    enable_musa_prefetch=True,
     train=dict(
         type=dataset_type,
         data_root=data_root,
@@ -268,3 +274,17 @@ log_config = dict(
     ])
 
 checkpoint_config = dict(interval=1)
+
+# Existing MUSA optimizations, applied by tools/train.py before plugin import.
+# Keep this model's backbone, BEV/input sizes and temporal queue unchanged.
+bev_opt = dict(
+    frozen_bn=True,
+    conv_epilogue=True,
+    conv_bn_fuse=True,
+    ffn_gemm_relu=True,
+    msda_col2im_smem=True,
+    backbone_channels_last=True,
+    # ResNet50 in tiny has no DCN layers.
+    dcn_gemm_bn_relu=False,
+    dcn_recompute_cols=False,
+)
