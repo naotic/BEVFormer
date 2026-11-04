@@ -54,7 +54,7 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         ret = defaultdict(list)
         for i in range(len(data_queue[0]['img'])):
             single_aug_data_queue = {}
-            for t in data_queue.keys():
+            for t in list(data_queue.keys()):
                 single_example = {}
                 for key ,value in data_queue[t].items():
                     single_example[key] = value[i]

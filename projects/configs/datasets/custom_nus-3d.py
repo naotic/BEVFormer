@@ -127,6 +127,7 @@ data = dict(
         box_type_3d='LiDAR'),
     test=dict(
         type=dataset_type,
+        samples_per_gpu=4,
         data_root=data_root,
         ann_file=data_root + 'nuscenes_infos_val.pkl',
         pipeline=test_pipeline,

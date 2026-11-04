@@ -31,6 +31,105 @@ ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
 
+class FusedSelfSDPAAttention(nn.Module):
+    def __init__(
+        self,
+        embed_dims=256,
+        num_heads=8,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        dropout_prob=0.1,
+        batch_first=False,
+    ):
+        super().__init__()
+        assert embed_dims % num_heads == 0
+
+        self.embed_dims = embed_dims
+        self.num_heads = num_heads
+        self.head_dim = embed_dims // num_heads
+        self.batch_first = batch_first
+        self.attn_drop = attn_drop
+
+        self.qkv_proj = nn.Linear(embed_dims, 3 * embed_dims, bias=True)
+        self.out_proj = nn.Linear(embed_dims, embed_dims, bias=True)
+
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.dropout_layer = nn.Dropout(dropout_prob)
+
+    def forward(
+        self,
+        query,
+        key=None,
+        value=None,
+        identity=None,
+        query_pos=None,
+        key_pos=None,
+        attn_mask=None,
+        key_padding_mask=None,
+        **kwargs,
+    ):
+        # 这个版本用于 self-attention
+        if identity is None:
+            identity = query
+
+        if query_pos is not None:
+            query = query + query_pos
+
+        # BEVFormer decoder 这里一般是 self-attn，key/value 可以忽略
+        # input: [L, B, C] -> [B, L, C]
+        if not self.batch_first:
+            query = query.transpose(0, 1).contiguous()
+
+        B, L, C = query.shape
+
+        qkv = self.qkv_proj(query)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        q = q.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if key_padding_mask is not None:
+            # MHA: True 表示 mask 掉
+            # SDPA bool mask: True 表示允许参与 attention
+            attn_mask = ~key_padding_mask[:, None, None, :]
+
+        # MUSA: SDPA+dropout only correct under MATH backend (hardcoded).
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        with sdpa_kernel(SDPBackend.MATH):
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop if self.training else 0.0,
+                is_causal=False,
+            )
+
+        out = out.transpose(1, 2).reshape(B, L, C)
+        out = self.out_proj(out)
+        out = self.proj_drop(out)
+
+        if not self.batch_first:
+            out = out.transpose(0, 1)
+
+        return identity + self.dropout_layer(out)
+
+def load_from_mmcv_mha(new_attn, old_mmcv_attn):
+    old_mha = old_mmcv_attn.attn
+
+    with torch.no_grad():
+        new_attn.qkv_proj.weight.copy_(old_mha.in_proj_weight)
+
+        if old_mha.in_proj_bias is not None:
+            new_attn.qkv_proj.bias.copy_(old_mha.in_proj_bias)
+
+        new_attn.out_proj.weight.copy_(old_mha.out_proj.weight)
+
+        if old_mha.out_proj.bias is not None:
+            new_attn.out_proj.bias.copy_(old_mha.out_proj.bias)
+
+
 def inverse_sigmoid(x, eps=1e-5):
     """Inverse function of sigmoid.
     Args:
@@ -62,6 +161,9 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
         super(DetectionTransformerDecoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
         self.fp16_enabled = False
+        # Use mmcv MultiheadAttention (do NOT replace with FusedSelfSDPAAttention).
+        # nn.MultiheadAttention still calls SDPA internally; train.py forces MATH SDP.
+
 
     def forward(self,
                 query,
@@ -108,12 +210,16 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
                 assert reference_points.shape[-1] == 3
 
                 new_reference_points = torch.zeros_like(reference_points)
-                new_reference_points[..., :2] = tmp[
-                    ..., :2] + inverse_sigmoid(reference_points[..., :2])
-                new_reference_points[..., 2:3] = tmp[
-                    ..., 4:5] + inverse_sigmoid(reference_points[..., 2:3])
+                # new_reference_points[..., :2] = tmp[
+                #     ..., :2] + inverse_sigmoid(reference_points[..., :2])
+                # new_reference_points[..., 2:3] = tmp[
+                #     ..., 4:5] + inverse_sigmoid(reference_points[..., 2:3])
 
-                new_reference_points = new_reference_points.sigmoid()
+                # new_reference_points = new_reference_points.sigmoid()
+                ref_xy = tmp[..., :2] + inverse_sigmoid(reference_points[..., :2])
+                ref_z = tmp[..., 4:5] + inverse_sigmoid(reference_points[..., 2:3])
+
+                new_reference_points = torch.cat([ref_xy, ref_z], dim=-1).sigmoid()
 
                 reference_points = new_reference_points.detach()
 
@@ -275,7 +381,7 @@ class CustomMSDeformableAttention(BaseModule):
         Returns:
              Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
-
+        assert self.batch_first==False and key_padding_mask is None
         if value is None:
             value = query
 
@@ -283,18 +389,20 @@ class CustomMSDeformableAttention(BaseModule):
             identity = query
         if query_pos is not None:
             query = query + query_pos
-        if not self.batch_first:
-            # change to (bs, num_query ,embed_dims)
-            query = query.permute(1, 0, 2)
-            value = value.permute(1, 0, 2)
+        # if not self.batch_first:
+        #     # change to (bs, num_query ,embed_dims)
+        #     query = query.permute(1, 0, 2)
+        #     value = value.permute(1, 0, 2)
+        query = query.permute(1, 0, 2)
+        value = value.permute(1, 0, 2)
 
         bs, num_query, _ = query.shape
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
         value = self.value_proj(value)
-        if key_padding_mask is not None:
-            value = value.masked_fill(key_padding_mask[..., None], 0.0)
+        # if key_padding_mask is not None:
+            # value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
 
         sampling_offsets = self.sampling_offsets(query).view(
@@ -322,7 +430,7 @@ class CustomMSDeformableAttention(BaseModule):
             raise ValueError(
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
-        if torch.cuda.is_available() and value.is_cuda:
+        if torch.musa.is_available() and value.is_musa:
 
             # using fp16 deformable attention is unstable because it performs many sum operations
             if value.dtype == torch.float16:
@@ -338,8 +446,9 @@ class CustomMSDeformableAttention(BaseModule):
 
         output = self.output_proj(output)
 
-        if not self.batch_first:
+        # if not self.batch_first:
             # (num_query, bs ,embed_dims)
-            output = output.permute(1, 0, 2)
+            # output = output.permute(1, 0, 2)
+        output = output.permute(1, 0, 2)
 
         return self.dropout(output) + identity

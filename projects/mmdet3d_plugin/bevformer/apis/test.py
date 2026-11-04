@@ -122,12 +122,12 @@ def collect_results_cpu(result_part, size, tmpdir=None):
         dir_tensor = torch.full((MAX_LEN, ),
                                 32,
                                 dtype=torch.uint8,
-                                device='cuda')
+                                device='musa')
         if rank == 0:
             mmcv.mkdir_or_exist('.dist_test')
             tmpdir = tempfile.mkdtemp(dir='.dist_test')
             tmpdir = torch.tensor(
-                bytearray(tmpdir.encode()), dtype=torch.uint8, device='cuda')
+                bytearray(tmpdir.encode()), dtype=torch.uint8, device='musa')
             dir_tensor[:len(tmpdir)] = tmpdir
         dist.broadcast(dir_tensor, 0)
         tmpdir = dir_tensor.cpu().numpy().tobytes().decode().rstrip()

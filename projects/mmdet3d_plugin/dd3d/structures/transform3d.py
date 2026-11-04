@@ -30,6 +30,10 @@ def make_device(device: Device) -> torch.device:
         # If cuda but with no index, then the current cuda device is indicated.
         # In that case, we fix to that device
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    elif device.type == "musa" and device.index is None:  # pyre-ignore[16]
+        # If cuda but with no index, then the current cuda device is indicated.
+        # In that case, we fix to that device
+        device = torch.device(f"musa:{torch.musa.current_device()}")
     return device
 
 
@@ -567,6 +571,8 @@ class Transform3d:
     def cuda(self) -> "Transform3d":
         return self.to("cuda")
 
+    def musa(self) -> "Transform3d":
+        return self.to("musa")
 
 class Translate(Transform3d):
     def __init__(
