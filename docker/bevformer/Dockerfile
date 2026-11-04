@@ -4,7 +4,7 @@ FROM ${BASE_REPOSITORY}:v2.1.7-rc4@sha256:9c7f3caa16a29c83381d29f0f5f6e3d7562a86
 COPY fetch_source.sh /tmp/fetch_source.sh
 RUN --mount=type=secret,id=github_token,required=true \
     bash /tmp/fetch_source.sh mmcv 7a9e1c36a4a45f47ff86fc52c0f1c152789e1217 && \
-    bash /tmp/fetch_source.sh BEVFormer f173220fb2b8504c93d54ebb6920446fa5ae26d9 && \
+    bash /tmp/fetch_source.sh BEVFormer abddac50dd1674661049a436ef02411fa522aa7d && \
     bash /tmp/fetch_source.sh mmdetection a3a31083aae74db0303acc7d45b07108471e89db && \
     bash /tmp/fetch_source.sh mmsegmentation 622c93028b2583588612714374e033411bd20257 && \
     bash /tmp/fetch_source.sh mmdetection3d 664a867a26278356d3103f9e0908b4bc4e9467e3 && \
