@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!requirements.txt
+!build_extension.py
+!fetch_source.sh
