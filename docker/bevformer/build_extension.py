@@ -15,6 +15,8 @@ def portable_flags(values):
 
 
 def setup(*args, **kwargs):
+    # Build dependencies come from Base and requirements.txt, not legacy downloads.
+    kwargs['setup_requires'] = []
     for extension in kwargs.get('ext_modules') or []:
         flags = extension.extra_compile_args
         extension.extra_compile_args = (
