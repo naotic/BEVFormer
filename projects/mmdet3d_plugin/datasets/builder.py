@@ -81,6 +81,7 @@ def build_dataloader(dataset,
                      seed=None,
                      shuffler_sampler=None,
                      nonshuffler_sampler=None,
+                     opencv_num_threads=None,
                      **kwargs):
     """Build PyTorch DataLoader.
     In distributed training, each GPU/process has a dataloader.
@@ -134,7 +135,8 @@ def build_dataloader(dataset,
 
     init_fn = partial(
         worker_init_fn, num_workers=num_workers, rank=rank,
-        seed=seed) if seed is not None else None
+        seed=seed, opencv_num_threads=opencv_num_threads
+    ) if seed is not None or opencv_num_threads is not None else None
 
     # DataLoader kwargs sanity:
     # - prefetch_factor is only valid when num_workers > 0
@@ -168,7 +170,12 @@ def build_dataloader(dataset,
     return data_loader
 
 
-def worker_init_fn(worker_id, num_workers, rank, seed):
+def worker_init_fn(worker_id, num_workers, rank, seed, opencv_num_threads=None):
+    if opencv_num_threads is not None:
+        import cv2
+        cv2.setNumThreads(opencv_num_threads)
+    if seed is None:
+        return
     # The seed of each worker equals to
     # num_worker * rank + worker_id + user_seed
     worker_seed = num_workers * rank + worker_id + seed

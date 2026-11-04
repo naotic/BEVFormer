@@ -66,7 +66,8 @@ def custom_train_detector(model,
         cfg.data.samples_per_gpu = cfg.data.imgs_per_gpu
 
     dataloader_kwargs = {}
-    for k in ('pin_memory', 'prefetch_factor', 'persistent_workers'):
+    for k in ('pin_memory', 'prefetch_factor', 'persistent_workers',
+              'opencv_num_threads'):
         if k in cfg.data:
             dataloader_kwargs[k] = cfg.data.get(k)
 

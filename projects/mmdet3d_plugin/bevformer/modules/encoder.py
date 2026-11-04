@@ -20,6 +20,7 @@ from mmcv.utils import ext_loader
 from .custom_base_transformer_layer import MyCustomBaseTransformerLayer
 from .multi_scale_deformable_attn_function import (
     _get_sca_mask_metadata)
+from projects.mmdet3d_plugin.models.utils.point_sampling import project_points
 ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
@@ -37,7 +38,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
     """
 
     def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes',
-                 **kwargs):
+                 compile_point_sampling=False, **kwargs):
 
         super(BEVFormerEncoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
@@ -45,6 +46,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
         self.num_points_in_pillar = num_points_in_pillar
         self.pc_range = pc_range
         self.fp16_enabled = False
+        self.compile_point_sampling = compile_point_sampling
 
     @staticmethod
     def get_reference_points(H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='musa', dtype=torch.float):
@@ -100,6 +102,10 @@ class BEVFormerEncoder(TransformerLayerSequence):
             lidar2img.append(img_meta['lidar2img'])
         lidar2img = np.asarray(lidar2img)
         lidar2img = reference_points.new_tensor(lidar2img)  # (B, N, 4, 4)
+        if self.compile_point_sampling:
+            height, width = img_metas[0]['img_shape'][0][:2]
+            return project_points(reference_points, lidar2img, tuple(pc_range),
+                                  height, width)
         reference_points = reference_points.clone()
 
         reference_points[..., 0:1] = reference_points[..., 0:1] * \

@@ -7,6 +7,7 @@ from .datasets.pipelines import (
   NormalizeMultiviewImage,  CustomCollect3D)
 from .models.utils import *
 from .models.opt.adamw import AdamW2
+from .models.opt.coalesced_adamw import CoalescedAdamW
 from .bevformer import *
 if __import__("os").environ.get("BEVFORMER_SELECTED_CONFIG") != "1":
     from .dd3d import *

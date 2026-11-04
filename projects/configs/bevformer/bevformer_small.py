@@ -85,6 +85,7 @@ model = dict(
             embed_dims=_dim_,
             encoder=dict(
                 type='BEVFormerEncoder',
+                compile_point_sampling=True,
                 num_layers=3,
                 pc_range=point_cloud_range,
                 num_points_in_pillar=4,
@@ -210,6 +211,7 @@ test_pipeline = [
 data = dict(
     samples_per_gpu=1,
     workers_per_gpu=4,
+    opencv_num_threads=1,
     pin_memory=True,
     persistent_workers=True,
     prefetch_factor=2,
@@ -243,7 +245,7 @@ data = dict(
 )
 
 optimizer = dict(
-    type='AdamW',
+    type='CoalescedAdamW',
     lr=2e-4,
     paramwise_cfg=dict(
         custom_keys={
