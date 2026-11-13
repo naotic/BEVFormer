@@ -23,6 +23,24 @@ from projects.mmdet3d_plugin.models.utils.bricks import run_time
 from mmcv.runner import force_fp32, auto_fp16
 
 
+def rotate_bev_fp32(img, angle, center):
+    """Preserve FP32 rotation-grid coordinates on MUSA.
+
+    Backend flags are process-wide; this assumes one forward thread per process.
+    """
+    if img.device.type != 'musa':
+        return rotate(img, angle, center=center)
+    mudnn_tf32 = torch.backends.mudnn.allow_tf32
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.mudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        return rotate(img, angle, center=center)
+    finally:
+        torch.backends.mudnn.allow_tf32 = mudnn_tf32
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+
+
 @TRANSFORMER.register_module()
 class PerceptionTransformer(BaseModule):
     """Implements the Detr3D transformer.
@@ -173,8 +191,8 @@ class PerceptionTransformer(BaseModule):
                     rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
                     tmp_prev_bev = prev_bev[:, i].reshape(
                         bev_h, bev_w, -1).permute(2, 0, 1)
-                    tmp_prev_bev = rotate(tmp_prev_bev, rotation_angle,
-                                          center=self.rotate_center)
+                    tmp_prev_bev = rotate_bev_fp32(
+                        tmp_prev_bev, rotation_angle, center=self.rotate_center)
                     tmp_prev_bev = tmp_prev_bev.permute(1, 2, 0).reshape(
                         bev_h * bev_w, 1, -1)
                     prev_bev[:, i] = tmp_prev_bev[:, 0]
